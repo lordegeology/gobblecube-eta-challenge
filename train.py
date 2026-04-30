@@ -99,9 +99,9 @@ def main() -> None:
     params = {
         "objective":        "regression_l1",   # MAE loss — directly optimises our metric
         "metric":           "mae",
-        "learning_rate":    0.05,
-        "num_leaves":       511,
-        "min_data_in_leaf": 200,
+        "learning_rate":    0.02,              # slower lr = more trees = better generalisation
+        "num_leaves":       255,               # reduced to avoid overfitting on early stop
+        "min_data_in_leaf": 500,               # higher = more conservative splits
         "feature_fraction": 0.7,
         "bagging_fraction": 0.8,
         "bagging_freq":     5,
@@ -117,7 +117,7 @@ def main() -> None:
     lgb_dev   = lgb.Dataset(X_dev,   label=y_dev,   feature_name=FEATURE_NAMES, free_raw_data=False)
 
     callbacks = [
-        lgb.early_stopping(stopping_rounds=50, verbose=True),
+        lgb.early_stopping(stopping_rounds=100, verbose=True),
         lgb.log_evaluation(period=50),
     ]
 
