@@ -27,26 +27,46 @@ Model: LightGBM with `objective=regression_l1` (directly optimises MAE, robust t
 
 Feature importance (top 5 by gain): `pair_median` >> `pair_mean` > `pair_p75` > `pair_p90` > `hour_cos`. The pair lookup stats dominate, confirming the core hypothesis.
 
-**What went wrong:** Early stopping fired at round 58/2000 — very early. Suggests learning rate (0.05) was too high, causing the model to overshoot and stop before fully converging.
+**What went wrong / what we learned:** Early stopping fired at round 58/2000. Suggested learning rate (0.05) might be too high — tried tuning in v2.
 
-### v2 — Tuned hyperparameters (in progress)
+---
+
+### v2 — Hyperparameter tuning (`259.9s Dev MAE`)
 
 Changes from v1:
-- `learning_rate`: 0.05 → 0.02 (slower steps, more trees, better generalisation)
-- `num_leaves`: 511 → 255 (less aggressive splits, reduces overfitting)
-- `early_stopping` patience: 50 → 100 rounds (gives slower lr room to keep improving)
+- `learning_rate`: 0.05 → 0.02
+- `num_leaves`: 511 → 255
+- Early stopping patience: 50 → 100 rounds
 
-Expecting the model to train for significantly more rounds and land below 250s.
+Model trained to round 151 this time (vs 58 in v1), but MAE was essentially unchanged — 259.9s vs 258.9s.
+
+**Conclusion: the model is not the bottleneck.** LightGBM is already extracting most of what the current features can offer. Further hyperparameter tuning has diminishing returns. The next lever is data quality — the README hints there is "plenty" of garbage left in the dataset after the basic cleaning in `download_data.py`. Reverting to v1 params (faster training, same score) and moving to data cleaning next.
+
+---
+
+### v3 — Data cleaning (in progress)
+
+The `download_data.py` script applies basic cleaning (drop trips <30s or >3h, invalid zones, fill missing passenger count) but leaves plenty of noise. Planned cleaning pass:
+
+- **Speed-based outlier removal** — compute implied speed as `dist_km / (duration / 3600)`. Drop trips with implied speed > 80 km/h (physically impossible in NYC traffic) or implausibly slow cross-borough trips.
+- **Same-zone duration outliers** — trips where pickup == dropoff zone with very long duration are likely meters left running, not real trips.
+- **Passenger count capping** — values above 6 are almost certainly data entry errors. Current cleaning fills missing with 1 but doesn't cap absurd values.
+- **Duplicate row removal** — exact (pickup_zone, dropoff_zone, requested_at, passenger_count) duplicates are likely logging artifacts.
+
+Cleaning is applied before building the lookup tables so the zone-pair stats are computed on clean data.
+
+---
 
 ## Scoreboard
 
 | Approach | Dev MAE |
 |---|---|
 | Predict global mean | ~580s |
-| Zone-pair lookup (10 lines, no ML) | 301s |
 | Baseline GBT — their repo | ~367s |
+| Zone-pair lookup (10 lines, no ML) | 301s |
 | **v1: LightGBM + feature engineering** | **258.9s** |
-| v2: + hyperparameter tuning | TBD |
+| v2: hyperparameter tuning | 259.9s (no improvement) |
+| v3: + data cleaning | TBD |
 
 ## How to reproduce
 
@@ -62,5 +82,5 @@ python -m pytest tests/
 
 1. **Weather join** — NOAA hourly data for JFK/LGA. Rain/snow adds 20–40% to trip time. The 2024 eval slice is a winter-holiday period which likely has weather disruption.
 2. **OSRM road-network distance** — haversine misses bridges, one-way streets, and East River crossings that dominate Manhattan–Brooklyn/Queens routes.
-3. **Zone embeddings + MLP** — a small neural net where each zone gets a learnable embedding, letting the model discover spatial relationships without explicit coordinates.
-4. **Hour × zone-pair interaction** — rush hour affects JFK→Midtown very differently from short local trips. An explicit (hour_bucket, pickup_zone, dropoff_zone) lookup could capture this.
+3. **Hour × zone-pair interaction** — rush hour affects JFK→Midtown very differently from short local trips. An explicit (hour_bucket, pickup_zone, dropoff_zone) lookup could capture this.
+4. **Zone embeddings + MLP** — a small neural net where each zone gets a learnable embedding, letting the model discover spatial relationships without explicit coordinates.
