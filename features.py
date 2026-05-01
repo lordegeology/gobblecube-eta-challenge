@@ -5,11 +5,12 @@ All feature construction lives here so training (train.py) and inference
 
 Feature groups
 --------------
-1. Zone-pair lookup stats   — mean/median/p75/p90/count per (pu, do) pair
-2. Zone-level stats         — mean duration when this zone is pickup or dropoff
-3. Zone centroid geometry   — haversine distance, bearing from TLC shapefile
-4. Time features            — cyclical hour/dow/month, rush-hour flag, weekend, holiday
-5. Raw identifiers          — pickup_zone, dropoff_zone (for tree splits)
+1. Zone-pair lookup stats        — mean/median/p75/p90/count per (pu, do) pair
+2. Hour x zone-pair lookup stats — mean/median per (pu, do, hour_bucket) pair
+3. Zone-level stats              — mean duration when this zone is pickup or dropoff
+4. Zone centroid geometry        — haversine distance, bearing from TLC shapefile
+5. Time features                 — cyclical hour/dow/month, rush-hour flag, weekend, holiday
+6. Raw identifiers               — pickup_zone, dropoff_zone (for tree splits)
 """
 
 from __future__ import annotations
@@ -148,6 +149,23 @@ def _bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Hour bucket helper
+# ---------------------------------------------------------------------------
+
+# 6 time-of-day buckets that capture distinct NYC traffic regimes:
+#   0 = night       22:00 - 04:59
+#   1 = early AM    05:00 - 06:59  (pre-rush)
+#   2 = AM rush     07:00 - 09:59
+#   3 = midday      10:00 - 15:59
+#   4 = PM rush     16:00 - 19:59
+#   5 = evening     20:00 - 21:59
+_HOUR_BUCKET = [0,0,0,0,0,1,1,2,2,2,3,3,3,3,3,3,4,4,4,4,5,5,0,0]  # index = hour
+
+def hour_bucket(h: int) -> int:
+    return _HOUR_BUCKET[h]
+
+
+# ---------------------------------------------------------------------------
 # Lookup table helpers
 # ---------------------------------------------------------------------------
 
@@ -160,6 +178,8 @@ class LookupTables:
     def __init__(self) -> None:
         # (pickup_zone, dropoff_zone) -> [mean, median, p75, p90, log_count]
         self.pair_stats: dict[tuple[int, int], list[float]] = {}
+        # (pickup_zone, dropoff_zone, hour_bucket) -> [mean, median]
+        self.hour_pair_stats: dict[tuple[int, int, int], list[float]] = {}
         # pickup_zone -> [mean, std]
         self.pu_stats: dict[int, list[float]] = {}
         # dropoff_zone -> [mean, std]
@@ -197,6 +217,17 @@ class LookupTables:
         for zone, row in grp_do.iterrows():
             self.do_stats[int(zone)] = [float(row["mean"]), float(row["std"])]
 
+        # Hour x zone-pair stats
+        df_hb = df.copy()
+        df_hb["hour_bucket"] = pd.to_datetime(df_hb["requested_at"]).dt.hour.map(lambda h: _HOUR_BUCKET[h])
+        grp_hp = df_hb.groupby(["pickup_zone", "dropoff_zone", "hour_bucket"])["duration_seconds"]
+        agg_hp = grp_hp.agg(["mean", "median"])
+        for (pu, do, hb), row in agg_hp.iterrows():
+            self.hour_pair_stats[(int(pu), int(do), int(hb))] = [
+                float(row["mean"]),
+                float(row["median"]),
+            ]
+
         return self
 
     def pair_lookup(self, pu: int, do: int) -> list[float]:
@@ -207,6 +238,18 @@ class LookupTables:
         # Fallback: try pickup-only mean, then global
         pu_m = self.pu_stats.get(pu, [self.global_mean, self.global_std])[0]
         return [pu_m, pu_m, pu_m * 1.15, pu_m * 1.3, 0.0]
+
+    def hour_pair_lookup(self, pu: int, do: int, hb: int) -> list[float]:
+        """Return [mean, median] for (zone pair, hour bucket), with fallback to pair stats."""
+        v = self.hour_pair_stats.get((pu, do, hb))
+        if v is not None:
+            return v
+        # Fallback to overall pair mean/median
+        pair = self.pair_stats.get((pu, do))
+        if pair:
+            return [pair[0], pair[1]]
+        pu_m = self.pu_stats.get(pu, [self.global_mean, self.global_std])[0]
+        return [pu_m, pu_m]
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +267,10 @@ FEATURE_NAMES = [
     "pair_p75",
     "pair_p90",
     "pair_log_count",
+    # hour x zone-pair lookup
+    "hour_pair_mean",
+    "hour_pair_median",
+    "hour_pair_ratio",   # hour_pair_mean / pair_mean — how much this bucket deviates
     # pickup-zone stats
     "pu_mean",
     "pu_std",
@@ -278,6 +325,12 @@ def build_row(
     pair = tables.pair_lookup(pu, do)
     pair_mean, pair_median, pair_p75, pair_p90, pair_log_count = pair
 
+    # --- hour x zone-pair lookup ---
+    hb = hour_bucket(ts.hour if isinstance(requested_at, datetime) else datetime.fromisoformat(requested_at).hour)
+    hp = tables.hour_pair_lookup(pu, do, hb)
+    hour_pair_mean, hour_pair_median = hp
+    hour_pair_ratio = hour_pair_mean / pair_mean if pair_mean > 0 else 1.0
+
     # --- zone stats ---
     pu_s = tables.pu_stats.get(pu, [tables.global_mean, tables.global_std])
     do_s = tables.do_stats.get(do, [tables.global_mean, tables.global_std])
@@ -318,6 +371,7 @@ def build_row(
     return [
         pu, do,
         pair_mean, pair_median, pair_p75, pair_p90, pair_log_count,
+        hour_pair_mean, hour_pair_median, hour_pair_ratio,
         pu_s[0], pu_s[1],
         do_s[0], do_s[1],
         dist_km, bearing_sin, bearing_cos,
@@ -341,6 +395,14 @@ def build_dataframe(df: pd.DataFrame, tables: LookupTables,
     # Pair lookup (vectorised via list comprehension — fast enough on 37M rows)
     pairs = [tables.pair_lookup(int(p), int(d)) for p, d in zip(pu, do)]
     pairs = np.array(pairs, dtype=np.float32)
+
+    # Hour x pair lookup
+    hb_arr = np.array([_HOUR_BUCKET[hh] for hh in ts.dt.hour.values], dtype=np.int8)
+    hour_pairs = [tables.hour_pair_lookup(int(p), int(d), int(hb))
+                  for p, d, hb in zip(pu, do, hb_arr)]
+    hour_pairs = np.array(hour_pairs, dtype=np.float32)
+    pair_means = pairs[:, 0]
+    hour_pair_ratio = np.where(pair_means > 0, hour_pairs[:, 0] / pair_means, 1.0).astype(np.float32)
 
     pu_arr = np.array([tables.pu_stats.get(int(z), [tables.global_mean, tables.global_std])
                        for z in pu], dtype=np.float32)
@@ -382,6 +444,8 @@ def build_dataframe(df: pd.DataFrame, tables: LookupTables,
     X = np.column_stack([
         pu, do,
         pairs,           # 5 cols
+        hour_pairs,      # 2 cols (mean, median)
+        hour_pair_ratio, # 1 col
         pu_arr,          # 2 cols
         do_arr,          # 2 cols
         dist_km, bearing_sin, bearing_cos,

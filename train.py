@@ -104,9 +104,9 @@ def main() -> None:
     params = {
         "objective":        "regression_l1",   # MAE loss — directly optimises our metric
         "metric":           "mae",
-        "learning_rate":    0.05,              # slower lr = more trees = better generalisation
-        "num_leaves":       511,               # reduced to avoid overfitting on early stop
-        "min_data_in_leaf": 500,               # higher = more conservative splits
+        "learning_rate":    0.03,            
+        "num_leaves":       255,               
+        "min_data_in_leaf": 500,               
         "feature_fraction": 0.7,
         "bagging_fraction": 0.8,
         "bagging_freq":     5,
