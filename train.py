@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from features import LookupTables, build_dataframe, _load_centroids, FEATURE_NAMES
+from clean import clean as clean_data
 
 DATA_DIR   = Path(__file__).parent / "data"
 MODEL_PATH = Path(__file__).parent / "model.pkl"
@@ -65,17 +66,21 @@ def clip_target(y: np.ndarray) -> np.ndarray:
 def main() -> None:
     train, dev = load_data()
 
+    # ---- 1b. Load centroids early so cleaning can use distance-based filters --
+    print("\nLoading zone centroids (needed for cleaning)...")
+    centroids = _load_centroids()
+    print(f"  {len(centroids)} zones with centroid data")
+
+    # ---- 1c. Clean training data ------------------------------------------
+    print("\nCleaning training data...")
+    train = clean_data(train, centroids, verbose=True)
+
     # ---- 1. Build lookup tables from training set -------------------------
     print("\nBuilding lookup tables from training set...")
     t0 = time.time()
     tables = LookupTables()
     tables.fit(train)
     print(f"  {len(tables.pair_stats):,} zone-pair entries  ({time.time()-t0:.1f}s)")
-
-    # ---- 2. Load / compute zone centroids ---------------------------------
-    print("\nLoading zone centroids...")
-    centroids = _load_centroids()
-    print(f"  {len(centroids)} zones with centroid data")
 
     # ---- 3. Build feature matrices ----------------------------------------
     print("\nBuilding feature matrices...")
@@ -99,8 +104,8 @@ def main() -> None:
     params = {
         "objective":        "regression_l1",   # MAE loss — directly optimises our metric
         "metric":           "mae",
-        "learning_rate":    0.05,              # v2 -> 0.02 didnt improve it at all, 0.05 is faster and good enough
-        "num_leaves":       511,               # v2 -> 255 didnt improve, 511 is good enough and faster to train
+        "learning_rate":    0.02,              # slower lr = more trees = better generalisation
+        "num_leaves":       255,               # reduced to avoid overfitting on early stop
         "min_data_in_leaf": 500,               # higher = more conservative splits
         "feature_fraction": 0.7,
         "bagging_fraction": 0.8,
