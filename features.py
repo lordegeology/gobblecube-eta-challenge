@@ -10,7 +10,8 @@ Feature groups
 3. Zone-level stats              — mean duration when this zone is pickup or dropoff
 4. Zone centroid geometry        — haversine distance, bearing from TLC shapefile
 5. Time features                 — cyclical hour/dow/month, rush-hour flag, weekend, holiday
-6. Raw identifiers               — pickup_zone, dropoff_zone (for tree splits)
+6. Weather features              — temp, precip, wind, snow from NOAA JFK/LGA stations
+7. Raw identifiers               — pickup_zone, dropoff_zone (for tree splits)
 """
 
 from __future__ import annotations
@@ -127,6 +128,49 @@ def _load_centroids() -> dict[int, tuple[float, float]]:
 def _save_centroids(centroids: dict, path: Path) -> None:
     rows = [{"zone_id": k, "lat": v[0], "lon": v[1]} for k, v in centroids.items()]
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+# ---------------------------------------------------------------------------
+# Weather lookup — loaded once, keyed by (date, hour)
+# ---------------------------------------------------------------------------
+
+_WEATHER_CACHE: dict | None = None
+_WEATHER_FALLBACK = {
+    "temp_c": 10.0, "precip_mm": 0.0, "wind_kmh": 10.0,
+    "snow_depth_mm": 0.0, "is_raining": 0, "is_snowing": 0,
+    "is_bad_weather": 0, "wind_strong": 0,
+}
+
+def load_weather() -> dict:
+    """Load weather lookup from CSV. Returns dict keyed by (date, hour)."""
+    global _WEATHER_CACHE
+    if _WEATHER_CACHE is not None:
+        return _WEATHER_CACHE
+
+    weather_path = Path(__file__).parent / "data" / "weather_hourly.csv"
+    if not weather_path.exists():
+        print("Warning: weather_hourly.csv not found. Run data/download_weather.py first.")
+        print("Weather features will be set to neutral fallback values.")
+        _WEATHER_CACHE = {}
+        return _WEATHER_CACHE
+
+    df = pd.read_csv(weather_path)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    _WEATHER_CACHE = {}
+    weather_cols = ["temp_c", "precip_mm", "wind_kmh", "snow_depth_mm",
+                    "is_raining", "is_snowing", "is_bad_weather", "wind_strong"]
+    for _, row in df.iterrows():
+        key = (row["date"], int(row["hour"]))
+        _WEATHER_CACHE[key] = {c: float(row[c]) for c in weather_cols if c in row}
+    print(f"  Loaded {len(_WEATHER_CACHE):,} hourly weather records")
+    return _WEATHER_CACHE
+
+
+def get_weather(ts: "datetime") -> dict:
+    """Get weather for a given timestamp. Falls back gracefully if missing."""
+    cache = load_weather()
+    key = (ts.date(), ts.hour)
+    return cache.get(key, _WEATHER_FALLBACK)
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -295,6 +339,15 @@ FEATURE_NAMES = [
     "is_rush_pm",   # 16-19 weekday
     "is_night",     # 22-5
     "is_early_am",  # 5-7
+    # weather
+    "temp_c",
+    "precip_mm",
+    "wind_kmh",
+    "snow_depth_mm",
+    "is_raining",
+    "is_snowing",
+    "is_bad_weather",
+    "wind_strong",
     # raw (kept for tree splits alongside cyclical)
     "hour",
     "dow",
@@ -368,6 +421,9 @@ def build_row(
     month_sin = math.sin(2 * math.pi * (month - 1) / 12)
     month_cos = math.cos(2 * math.pi * (month - 1) / 12)
 
+    # --- weather ---
+    w = get_weather(ts)
+
     return [
         pu, do,
         pair_mean, pair_median, pair_p75, pair_p90, pair_log_count,
@@ -379,6 +435,8 @@ def build_row(
         dow_sin, dow_cos,
         month_sin, month_cos,
         is_weekend, is_holiday, is_rush_am, is_rush_pm, is_night, is_early_am,
+        w["temp_c"], w["precip_mm"], w["wind_kmh"], w["snow_depth_mm"],
+        w["is_raining"], w["is_snowing"], w["is_bad_weather"], w["wind_strong"],
         h, dow, month,
         int(passenger_count),
     ]
@@ -441,19 +499,43 @@ def build_dataframe(df: pd.DataFrame, tables: LookupTables,
 
     pc = df["passenger_count"].fillna(1).astype(np.int8).values
 
-    X = np.column_stack([
-        pu, do,
-        pairs,           # 5 cols
-        hour_pairs,      # 2 cols (mean, median)
-        hour_pair_ratio, # 1 col
-        pu_arr,          # 2 cols
-        do_arr,          # 2 cols
-        dist_km, bearing_sin, bearing_cos,
-        np.sin(tau_h), np.cos(tau_h),
-        np.sin(tau_d), np.cos(tau_d),
-        np.sin(tau_m), np.cos(tau_m),
-        is_weekend, is_holiday, is_rush_am, is_rush_pm, is_night, is_early_am,
-        h, dow, month,
-        pc,
-    ])
-    return X.astype(np.float32)
+    # Weather lookup — pre-allocate float32 array to avoid 10GB float64 blowup
+    weather_cache = load_weather()
+    w_cols = ["temp_c", "precip_mm", "wind_kmh", "snow_depth_mm",
+               "is_raining", "is_snowing", "is_bad_weather", "wind_strong"]
+    n = len(df)
+    weather_arr = np.zeros((n, len(w_cols)), dtype=np.float32)
+    fallback_vals = np.array([_WEATHER_FALLBACK[c] for c in w_cols], dtype=np.float32)
+    for i, (d, hh) in enumerate(zip(ts.dt.date.values, ts.dt.hour.values)):
+        w = weather_cache.get((d, int(hh)))
+        if w is not None:
+            weather_arr[i] = [w[c] for c in w_cols]
+        else:
+            weather_arr[i] = fallback_vals
+
+    # Build final matrix entirely in float32 — avoids numpy upcasting to float64
+    X = np.empty((n, len(FEATURE_NAMES)), dtype=np.float32)
+    col = 0
+    def put(*arrs):
+        nonlocal col
+        for a in arrs:
+            a = np.asarray(a, dtype=np.float32)
+            if a.ndim == 1:
+                X[:, col] = a
+                col += 1
+            else:
+                X[:, col:col + a.shape[1]] = a
+                col += a.shape[1]
+
+    put(pu, do)
+    put(pairs)
+    put(hour_pairs, hour_pair_ratio)
+    put(pu_arr, do_arr)
+    put(dist_km, bearing_sin, bearing_cos)
+    put(np.sin(tau_h), np.cos(tau_h))
+    put(np.sin(tau_d), np.cos(tau_d))
+    put(np.sin(tau_m), np.cos(tau_m))
+    put(is_weekend, is_holiday, is_rush_am, is_rush_pm, is_night, is_early_am)
+    put(weather_arr)
+    put(h, dow, month, pc)
+    return X
