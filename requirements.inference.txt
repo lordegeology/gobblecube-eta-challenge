@@ -1,0 +1,6 @@
+# Inference-only requirements — used in Docker image
+# Kept minimal to stay well under the 2.5 GB image size limit
+pandas>=2.0,<3
+numpy>=1.24,<3
+pyarrow>=14,<25
+lightgbm>=4.0,<5

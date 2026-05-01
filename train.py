@@ -104,9 +104,9 @@ def main() -> None:
     params = {
         "objective":        "regression_l1",   # MAE loss — directly optimises our metric
         "metric":           "mae",
-        "learning_rate":    0.03,            
-        "num_leaves":       255,               
-        "min_data_in_leaf": 500,               
+        "learning_rate":    0.02,              # slower lr = more trees = better generalisation
+        "num_leaves":       255,               # reduced to avoid overfitting on early stop
+        "min_data_in_leaf": 500,               # higher = more conservative splits
         "feature_fraction": 0.7,
         "bagging_fraction": 0.8,
         "bagging_freq":     5,
@@ -118,8 +118,13 @@ def main() -> None:
         "seed":             42,
     }
 
-    lgb_train = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_NAMES, free_raw_data=False)
-    lgb_dev   = lgb.Dataset(X_dev,   label=y_dev,   feature_name=FEATURE_NAMES, free_raw_data=False)
+    # Log-transform target: compresses right tail, helps model focus on
+    # short/medium trips rather than being distorted by rare long outliers.
+    # Predictions are expm1()-transformed back at eval time.
+    y_train_log = np.log1p(y_train)
+
+    lgb_train = lgb.Dataset(X_train, label=y_train_log, feature_name=FEATURE_NAMES, free_raw_data=False)
+    lgb_dev   = lgb.Dataset(X_dev,   label=np.log1p(y_dev), feature_name=FEATURE_NAMES, free_raw_data=False)
 
     callbacks = [
         lgb.early_stopping(stopping_rounds=100, verbose=True),
@@ -138,8 +143,9 @@ def main() -> None:
     print(f"\n  Training complete in {elapsed:.0f}s — best iteration: {model.best_iteration}")
 
     # ---- 5. Evaluate -------------------------------------------------------
-    preds_dev = model.predict(X_dev, num_iteration=model.best_iteration)
-    mae_dev   = float(np.mean(np.abs(preds_dev - y_dev)))
+    preds_dev_log = model.predict(X_dev, num_iteration=model.best_iteration)
+    preds_dev     = np.expm1(preds_dev_log)   # back to seconds
+    mae_dev       = float(np.mean(np.abs(preds_dev - y_dev)))
     print(f"\n  Dev MAE (LightGBM): {mae_dev:.1f} s")
     print(f"  Improvement over zone-pair lookup: {mae_lookup - mae_dev:.1f} s")
 
