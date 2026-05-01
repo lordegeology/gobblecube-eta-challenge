@@ -34,7 +34,7 @@ Feature importance (top 5 by gain): `pair_median` >> `pair_mean` > `pair_p75` > 
 ### v2 — Hyperparameter tuning (`259.9s Dev MAE`)
 
 - `learning_rate`: 0.05 → 0.02
-- `num_leaves`: 511 → 255  
+- `num_leaves`: 511 → 255
 - Early stopping patience: 50 → 100 rounds
 
 Model trained to round 151 (vs 58 in v1) but MAE was essentially unchanged.
@@ -45,34 +45,64 @@ Model trained to round 151 (vs 58 in v1) but MAE was essentially unchanged.
 
 ### v3 — Data cleaning, with duration clip (`261.3s Dev MAE`)
 
-The `download_data.py` script leaves a lot of noise after basic filtering. Added `clean.py` with the following passes applied before building lookup tables:
+Added `clean.py` with structural filters applied before building lookup tables:
 
-- **Passenger count in [1, 6]** — removed 557,219 rows. NYC taxis seat max 6; values of 0, 7, 8, 9 are data entry errors.
-- **Duplicate rows** — removed 297,907 rows. Same (pickup, dropoff, timestamp, pax) appearing twice is a logging artifact.
-- **Implied speed > 80 km/h** — removed 295,359 rows. Physically impossible in NYC traffic; likely bad timestamps or wrong zone IDs.
-- **Cross-zone speed < 1 km/h** — removed 6,312 rows. Meter left running after trip ended.
-- **Same-zone duration > 45 min** — removed 20,294 rows. Circling within one small zone for 45+ minutes is not a real trip.
-- **Duration p0.1–p99.9 clip** — removed 69,543 rows.
+| Filter | Removed | Rationale |
+|---|---|---|
+| Passenger count in [1, 6] | 557,219 | NYC taxis seat max 6; values >6 are data entry errors |
+| Duplicate rows | 297,907 | Same (pickup, dropoff, timestamp, pax) twice = logging artifact |
+| Implied speed > 80 km/h | 295,359 | Physically impossible in NYC traffic |
+| Cross-zone speed < 1 km/h | 6,312 | Meter left running after trip ended |
+| Same-zone duration > 45 min | 20,294 | Circling within one zone for 45+ min is not a real trip |
+| Duration p0.1–p99.9 clip | 69,543 | Aggressive tail removal |
 
-Total removed: 1,246,581 / 36,700,289 (3.40%). Remaining: 35,453,708 rows.
+Total removed: 1,246,581 / 36,700,289 (3.40%)
 
-**Result: 261.3s — slight regression.** The duration clip was too aggressive — it narrowed the training distribution vs dev and hurt tail calibration.
+**Result: 261.3s — slight regression.** Duration clip narrowed training distribution vs dev, hurting tail calibration.
 
 ---
 
 ### v4 — Data cleaning, without duration clip (`260.8s Dev MAE`)
 
-Removed the p0.1–p99.9 duration clip. All other filters kept.
+Removed the p0.1–p99.9 duration clip. All structural filters kept.
 
 Total removed: 1,177,038 / 36,700,289 (3.21%). Remaining: 35,523,251 rows.
 
-**Result: 260.8s — still no meaningful improvement over v1 (258.9s).**
+**Result: 260.8s — still no meaningful improvement over v1.** LightGBM with L1 loss was already robust to the noise we were removing. The feature set is the bottleneck, not data quality.
 
-The pattern across v1–v4 is now clear: every run lands within 2s of 259s regardless of cleaning or hyperparameter changes. LightGBM with L1 loss is already robust to the noise we were removing. **The feature set is the bottleneck, not the data quality or model configuration.**
+---
 
-The core problem: `pair_mean` and `pair_median` are single numbers — the average duration for a zone pair across all hours and days. A JFK→Midtown trip at 8am Friday rush is completely different from the same route at 11pm Sunday, but the model only sees one historical average for both. We need time-conditional zone-pair features.
+### v4.5 — Hyperparameter search on cleaned data (best: `257.7s train / 259.9s grade`)
 
-**Next: hour × zone-pair interaction lookup.**
+With clean data locked in, tried several hyperparameter combinations to find the best configuration before moving to new features:
+
+| lr | num_leaves | min_data_in_leaf | Train MAE | Grade MAE |
+|---|---|---|---|---|
+| 0.05 | 511 | 500 | 258.6s | 260.8s |
+| 0.02 | 255 | 500 | 259.1s | 259.9s |
+| 0.05 | 511 | 200 | 257.7s | 259.9s |
+
+Best configuration: `lr=0.05`, `num_leaves=511`, `min_data_in_leaf=200`. Marginal differences confirm the model is not the bottleneck — all combinations cluster around 259-261s.
+
+---
+
+### v5 — Hour × zone-pair lookup (`260.3s Dev MAE`)
+
+Added 3 new features to `features.py`:
+
+- **`hour_pair_mean`** — mean duration per (pickup_zone, dropoff_zone, hour_bucket). JFK→Midtown at AM rush gets its own historical average, separate from JFK→Midtown at midnight.
+- **`hour_pair_median`** — median for the same grouping, more robust to within-bucket outliers.
+- **`hour_pair_ratio`** — `hour_pair_mean / pair_mean`. Captures relative congestion: a ratio of 1.4 means this route runs 40% slower during this time bucket than its daily average. Generalises across routes of different lengths.
+
+6 time buckets: night (22-5), early AM (5-7), AM rush (7-10), midday (10-16), PM rush (16-20), evening (20-22).
+
+**Feature importance shift:** `hour_pair_median` immediately became #1 by a massive margin, displacing `pair_median`. The model finds time-conditional stats far more informative than all-day averages — exactly as predicted.
+
+**Result: 260.3s — MAE unchanged despite better features.** Tried lr=0.03/leaves=255 as well, still ~260s. The model is extracting the right signals but MAE won't budge.
+
+**Conclusion:** LightGBM has hit its ceiling on this feature set at ~259s. The remaining gap is likely a temporal distribution shift — training on 2023 data, evaluating on early 2024. Our lookup tables encode 2023 patterns and can't adapt to January 2024 conditions (different weather, demand patterns, post-holiday effects). No amount of feature engineering on historical averages fixes this without new information.
+
+**Next:** weather join (directly addresses temporal gap) or MLP with zone embeddings (richer representations).
 
 ---
 
@@ -86,7 +116,8 @@ The core problem: `pair_mean` and `pair_median` are single numbers — the avera
 | v2 | Hyperparameter tuning | 259.9s |
 | v3 | Data cleaning + duration clip | 261.3s |
 | v4 | Data cleaning, no duration clip | 260.8s |
-| v5 | Hour × zone-pair interaction lookup | TBD |
+| v4.5 | Hyperparameter search on clean data | 259.9s |
+| v5 | Hour × zone-pair lookup (33 features) | 260.3s |
 
 ## How to reproduce
 
@@ -100,7 +131,7 @@ python -m pytest tests/
 
 ## What I'd try next with more time
 
-1. **Hour × zone-pair lookup** — pre-compute mean duration per (pickup_zone, dropoff_zone, hour_bucket) where hour_bucket groups hours into ~6 bands (night, early AM, AM rush, midday, PM rush, evening). Directly addresses the biggest remaining gap.
-2. **Weather join** — NOAA hourly data for JFK/LGA. Rain/snow adds 20–40% to trip time. The 2024 eval slice is a winter-holiday period which likely has weather disruption — this could be the single biggest remaining gain.
+1. **Weather join** — NOAA hourly data for JFK/LGA. Rain/snow adds 20–40% to trip time. The 2024 eval slice is a winter-holiday period — systematic weather effects are likely the single biggest remaining source of error.
+2. **MLP with zone embeddings** — replace LightGBM with a small neural net where each zone gets a learnable embedding. Lets the model discover spatial relationships beyond what haversine distance captures. Most valuable if combined with the full feature set we've built.
 3. **OSRM road-network distance** — haversine misses bridges, one-way streets, and East River crossings that dominate Manhattan–Brooklyn/Queens routes.
-4. **Zone embeddings + MLP** — a small neural net where each zone gets a learnable embedding. Likely marginal given LightGBM already has pair lookup stats, but worth exploring if the above don't move the needle.
+4. **Day-of-week × zone-pair lookup** — same idea as hour × zone-pair but for weekday vs weekend. Some routes (e.g. nightlife areas) behave completely differently on weekends.
