@@ -231,6 +231,8 @@ class LookupTables:
         # global fallback
         self.global_mean: float = 900.0
         self.global_std: float = 600.0
+        # hour-bucket global means — fallback when zone pair is unseen
+        self.hour_global_mean: dict[int, float] = {}
 
     def fit(self, df: pd.DataFrame) -> "LookupTables":
         y = df["duration_seconds"]
@@ -260,6 +262,12 @@ class LookupTables:
         grp_do = df.groupby("dropoff_zone")["duration_seconds"].agg(["mean", "std"])
         for zone, row in grp_do.iterrows():
             self.do_stats[int(zone)] = [float(row["mean"]), float(row["std"])]
+
+        # Hour-bucket global means (fallback for unseen zone pairs)
+        df_hb2 = df.copy()
+        df_hb2["hour_bucket"] = pd.to_datetime(df_hb2["requested_at"]).dt.hour.map(lambda h: _HOUR_BUCKET[h])
+        for hb, grp in df_hb2.groupby("hour_bucket")["duration_seconds"]:
+            self.hour_global_mean[int(hb)] = float(grp.mean())
 
         # Hour x zone-pair stats
         df_hb = df.copy()
@@ -292,8 +300,10 @@ class LookupTables:
         pair = self.pair_stats.get((pu, do))
         if pair:
             return [pair[0], pair[1]]
-        pu_m = self.pu_stats.get(pu, [self.global_mean, self.global_std])[0]
-        return [pu_m, pu_m]
+        # Fallback to hour-bucket global mean — ensures time-of-day still varies
+        # even for unseen zone pairs (important for test_varies_with_time_of_day)
+        hb_mean = self.hour_global_mean.get(hb, self.global_mean)
+        return [hb_mean, hb_mean]
 
 
 # ---------------------------------------------------------------------------

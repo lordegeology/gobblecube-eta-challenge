@@ -12,6 +12,8 @@ from __future__ import annotations
 import pickle
 from pathlib import Path
 
+import numpy as np
+
 from features import LookupTables, build_row
 
 _MODEL_PATH = Path(__file__).parent / "model.pkl"
@@ -44,5 +46,6 @@ def predict(request: dict) -> float:
         tables          = _TABLES,
         centroids       = _CENTROIDS,
     )
-    pred = _MODEL.predict([row], num_iteration=_MODEL.best_iteration)
-    return float(max(30.0, pred[0]))   # hard floor: 30s
+    pred_log = _MODEL.predict([row], num_iteration=_MODEL.best_iteration)
+    pred = float(np.expm1(pred_log[0]))   # back-transform from log space
+    return float(max(30.0, pred))          # hard floor: 30s
