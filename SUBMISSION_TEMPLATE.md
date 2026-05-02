@@ -28,9 +28,11 @@ The baseline GBT scores ~367s MAE — worse than a 10-line zone-pair mean lookup
 
 Used Claude (claude.ai) throughout — not just for code generation but as a thinking partner for the whole approach.
 
-**Most valuable:** the iterative debugging loop. When the TLC shapefile centroid loader silently returned 0 zones (because `row.get()` doesn't work on pandas Series the way it does on dicts, and the glob pattern `*.shp` missed the file inside a subdirectory), Claude diagnosed both issues from the error output in seconds. Same with the float64 memory blowup when adding weather features and identified the root cause (numpy upcasting in `column_stack` before the `astype(float32)` cast) and rewrote to a pre-allocated float32 matrix. These are the kinds of bugs that cost hours to track down manually.
+**Most valuable:** the iterative debugging loop. When the TLC shapefile centroid loader silently returned 0 zones (because `row.get()` doesn't work on pandas Series the way it does on dicts, and the glob pattern `*.shp` missed the file inside a subdirectory), Claude diagnosed both issues from the error output in seconds. Same with the float64 memory blowup when adding weather features — Claude identified the root cause (numpy upcasting in `column_stack` before the `astype(float32)` cast) and rewrote to a pre-allocated float32 matrix. These are the kinds of bugs that cost hours to track down manually.
 
 **Second most valuable:** reasoning about what to try next. After each run, talking through why MAE wasn't improving (model bottleneck vs feature bottleneck vs data bottleneck) helped avoid wasted iterations. The conclusion that the DL path (zone embeddings) doesn't fix the root cause — a temporal distribution shift between 2023 training data and 2024 eval — came out of that kind of conversation.
+
+**Where it fell short:** Claude couldn't fetch NOAA URLs due to sandbox network restrictions, so those required manual steps. The NOAA station IDs also needed verification against the actual API rather than relying on model knowledge.
 
 ---
 
@@ -50,9 +52,9 @@ python data/download_data.py       # one-time, ~500 MB
 python data/download_weather.py    # one-time, ~2 min
 python train.py                    # builds model.pkl (~11 MB), takes ~30 min
 python grade.py                    # should print ~259s Dev MAE
-python -m pytest tests/
+python -m pytest tests/ --import-mode=importlib
 ```
 
 ---
 
-_Total time spent on this challenge: ~32 hours._
+_Total time spent on this challenge: ~40 hours._
